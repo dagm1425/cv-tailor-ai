@@ -1,60 +1,90 @@
-import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import AWS from 'aws-sdk';
-import { Configuration, OpenAIApi } from 'openai';
-import pdfParse from 'pdf-parse';
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { DynamoDBClient, PutItemCommand, QueryCommand } from "@aws-sdk/client-dynamodb";
+import { Configuration, OpenAIApi } from "openai";
+import pdfParse from "pdf-parse";
+import mammoth from "mammoth";
 
-const s3 = new AWS.S3();
-const dynamo = new AWS.DynamoDB.DocumentClient();
+const BUCKET = process.env.BUCKET!;
+const TABLE = process.env.TABLE!;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
 
-const openai = new OpenAIApi(new Configuration({
-  apiKey: process.env.OPENAI_API_KEY,
-}));
+const s3 = new S3Client({});
+const dynamo = new DynamoDBClient({});
+const openai = new OpenAIApi(new Configuration({ apiKey: OPENAI_API_KEY }));
 
-interface CVRequestBody {
-  jobDescription: string;
-  fileName: string;
-  fileContentBase64: string;
-  userId: string;
-}
-
-export const main = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
+export const main = async (event: any) => {
   try {
-    if (!event.body) throw new Error('Missing request body');
+    const body = JSON.parse(event.body);
+    const { userId, cvBase64, jobPost } = body;
 
-    const body: CVRequestBody = JSON.parse(event.body);
-    const { jobDescription, fileName, fileContentBase64, userId } = body;
+    // Decode Base64 to buffer
+    const buffer = Buffer.from(cvBase64, "base64");
 
-    const buffer = Buffer.from(fileContentBase64, 'base64');
+    // Detect file type (simple check)
+    let cvText = "";
+    if (body.fileName?.endsWith(".pdf")) {
+      const pdfData = await pdfParse(buffer);
+      cvText = pdfData.text;
+    } else if (body.fileName?.endsWith(".docx")) {
+      const result = await mammoth.extractRawText({ buffer });
+      cvText = result.value;
+    } else {
+      throw new Error("Unsupported file type. Only PDF or DOCX allowed.");
+    }
 
-    // parse PDF or text
-    const textContent = fileName.endsWith('.pdf') ? (await pdfParse(buffer)).text : buffer.toString('utf-8');
-
-    // OpenAI API
-    const prompt = `Job Description:\n${jobDescription}\n\nCandidate CV:\n${textContent}\n\nGenerate a tailored CV emphasizing relevant skills and experiences.`;
-
+    // Call OpenAI to tailor CV
     const aiResponse = await openai.createChatCompletion({
-      model: 'gpt-4o-mini',
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 1000,
+      model: "gpt-4",
+      messages: [
+        { role: "system", content: "You are an expert CV writer." },
+        {
+          role: "user",
+          content: `Tailor this CV to the following job:\n${jobPost}\n\nCV:\n${cvText}`,
+        },
+      ],
+      max_tokens: 1500,
     });
 
-    const tailoredCV = aiResponse.data.choices[0].message?.content || '';
+    const tailoredCV = aiResponse.data.choices[0].message?.content || "";
 
-    // Save to S3
-    const origKey = `original/${userId}/${fileName}`;
-    const tailoredKey = `tailored/${userId}/${fileName}`;
+    // Save original CV to S3
+    const timestamp = Date.now();
+    const originalKey = `original/${userId}-${timestamp}`;
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: BUCKET,
+        Key: originalKey,
+        Body: buffer,
+      })
+    );
 
-    await s3.putObject({ Bucket: process.env.BUCKET!, Key: origKey, Body: buffer }).promise();
-    await s3.putObject({ Bucket: process.env.BUCKET!, Key: tailoredKey, Body: tailoredCV }).promise();
+    // Save tailored CV to S3
+    const tailoredKey = `tailored/${userId}-${timestamp}.txt`;
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: BUCKET,
+        Key: tailoredKey,
+        Body: tailoredCV,
+      })
+    );
 
-    // Save metadata
-    await dynamo.put({
-      TableName: process.env.TABLE!,
-      Item: { userId, timestamp: new Date().toISOString(), jobTitle: 'Uploaded CV', originalKey: origKey, tailoredKey },
-    }).promise();
+    // Store metadata in DynamoDB
+    await dynamo.send(
+      new PutItemCommand({
+        TableName: TABLE,
+        Item: {
+          userId: { S: userId },
+          timestamp: { S: new Date(timestamp).toISOString() },
+          s3OriginalKey: { S: originalKey },
+          s3TailoredKey: { S: tailoredKey },
+        },
+      })
+    );
 
-    return { statusCode: 200, body: JSON.stringify({ tailoredCV, downloadKey: tailoredKey }) };
-
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ tailoredCV, s3Key: tailoredKey }),
+    };
   } catch (err: any) {
     console.error(err);
     return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
